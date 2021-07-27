@@ -1,20 +1,45 @@
+# Copyright Contributors to the Amundsen project.
+# SPDX-License-Identifier: Apache-2.0
 import json
-import logging
-from typing import Any
+from typing import Any, Dict, Sequence
 
 import requests
 from databuilder.models.dashboard.dashboard_metadata import DashboardMetadata
 from databuilder.models.dashboard.dashboard_table import DashboardTable
-from databuilder.models.table_lineage import TableLineage, ColumnLineage
+from databuilder.models.table_lineage import ColumnLineage, TableLineage
 from databuilder.models.table_metadata import TableMetadata
 from databuilder.transformer.base_transformer import Transformer
-
 from pyhocon import ConfigTree
 
-logging.basicConfig(
-    filename="./error.log",
-    level=logging.INFO
-)
+from sentinel_task import SentinelTask
+
+API_ENDPOINT = "/api/v1/amundsen-lineage"
+BATCH_SIZE = 10
+
+AMUNDSEN_DASHBOARD_TABLE = "DashboardTable"
+AMUNDSEN_TABLE_LINEAGE = "TableLineage"
+AMUNDSEN_COLUMN_LINEAGE = "ColumnLineage"
+
+
+def _map_alvin_object_to_amundsen_node(res) -> Any:
+    if res.get("model", None) == AMUNDSEN_DASHBOARD_TABLE:
+        return DashboardTable(
+            dashboard_group_id=res.get("dashboardGroupId"),
+            dashboard_id=res.get("dashboardId"),
+            table_ids=res.get("tableIds"),
+            product=res.get("product", ""),
+            cluster="None"
+        )
+    elif res.get("model", None) == AMUNDSEN_TABLE_LINEAGE:
+        return TableLineage(
+            table_key=res.get("tableKey"),
+            downstream_deps=res.get("downstreamDeps")
+        )
+    elif res.get("model", None) == AMUNDSEN_COLUMN_LINEAGE:
+        return ColumnLineage(
+            column_key=res.get("columnKey"),
+            downstream_deps=res.get("downstreamDeps")
+        )
 
 
 class AlvinTransformer(Transformer):
@@ -24,53 +49,40 @@ class AlvinTransformer(Transformer):
     ALVIN_INSTANCE_URL = "alvin_instance_url"
     TABLEAU_SITE_NAME = "tableau_site_name"
 
-    def __init__(self):
+    def __init__(self) -> None:
+        super().__init__()
         self.conf = None
+        self.records = []
 
+    # noinspection PyAttributeOutsideInit
     def init(self, conf: ConfigTree) -> None:
         self.conf = conf
+        self.alvin_instance = self.conf.get(AlvinTransformer.ALVIN_INSTANCE_URL)
+        self.alvin_api_key = self.conf.get(AlvinTransformer.ALVIN_API_KEY)
+        self.dashboard_config = self.conf.get(AlvinTransformer.TABLEAU_SITE_NAME, None)
+        self.alvin_platform_config = {
+            "platform_id": self.conf.get(AlvinTransformer.ALVIN_PLATFORM_NAME),
+            "platform_type": self.conf.get(AlvinTransformer.ALVIN_PLATFORM_TYPE)
+        }
 
-    def transform(self, record: Any):
-        yield record
+    def transform(self, record: Any) -> Any:
+        if record != SentinelTask.SENTINEL_VALUE:
+            self.records.append(record)
+            yield record
+        else:
+            query_objects = []
+            for rec in self.records:
+                query_objects.extend(self._convert_amundsen_object_to_alvin_api_call(rec))
 
-        # preparing for multiple urls to request lineage from.
-        reqs = []
+            batches = [query_objects[i:i + BATCH_SIZE] for i in range(0, len(query_objects), BATCH_SIZE)]
 
-        if isinstance(record, TableMetadata):
-            reqs.append(self._generate_query_params(record._get_table_key(), "TABLE"))
-            for col in record.columns:
-                reqs.append(self._generate_query_params(record._get_col_key(col), "COLUMN"))
+            for batch in batches:
+                response = self._call_alvin_api(request_entities=batch)
+                for res in response:
+                    obj = _map_alvin_object_to_amundsen_node(res)
+                    yield obj
 
-        elif isinstance(record, DashboardMetadata):
-            reqs.append(self._generate_query_params(record._get_dashboard_key(), "WORKBOOK"))
-
-        responses = []
-
-        for data in reqs:
-            responses.extend(self._get_alvin_lineage(*data))
-
-        # Want to add more models? Just add another if statement here
-        for res in responses:
-            if res.get("model", None) == "DashboardTable":
-                yield DashboardTable(
-                    dashboard_group_id=res.get("dashboardGroupId"),
-                    dashboard_id=res.get("dashboardId"),
-                    table_ids=res.get("tableIds"),
-                    product=res.get("product", ""),
-                    cluster="None"
-                )
-            elif res.get("model", None) == "TableLineage":
-                yield TableLineage(
-                    table_key=res.get("tableKey"),
-                    downstream_deps=res.get("downstreamDeps")
-                )
-            elif res.get("model", None) == "ColumnLineage":
-                yield ColumnLineage(
-                    column_key=res.get("columnKey"),
-                    downstream_deps=res.get("downstreamDeps")
-                )
-
-    def _generate_query_params(self, entity_id, entity_type):
+    def _generate_query_object(self, entity_id, entity_type) -> Dict[str, str]:
         """
 
         :param entity_id: the Amundsen-formatted entity ID
@@ -78,21 +90,36 @@ class AlvinTransformer(Transformer):
                             Mapped automatically in transform()
         :return: tuple of URL and query params for the Alvin API request
         """
-        return f"{self.conf.get(AlvinTransformer.ALVIN_INSTANCE_URL)}/api/v1/amundsen_table_lineage", {
-            "platformId": self.conf.get(AlvinTransformer.ALVIN_PLATFORM_NAME),
-            "entityId": entity_id,
-            "entityType": entity_type,
-            "dashboardSiteName": self.conf.get(AlvinTransformer.TABLEAU_SITE_NAME, ''),
-            "platformType": self.conf.get(AlvinTransformer.ALVIN_PLATFORM_TYPE)
+        d: Dict = {
+            "entity_id": entity_id,
+            "entity_type": entity_type
         }
+        d.update(self.alvin_platform_config)
+        if self.dashboard_config:
+            d.update({"dashboard_site_name": self.dashboard_config})
+        return d
 
-    def _get_alvin_lineage(self, url, params):
-        payload = {}
+    def _convert_amundsen_object_to_alvin_api_call(self, record: Any) -> Sequence[Dict[str, str]]:
+        reqs = []
+        if isinstance(record, TableMetadata):
+            reqs.append(self._generate_query_object(record._get_table_key(), "TABLE"))
+            for col in record.columns:
+                reqs.append(self._generate_query_object(record._get_col_key(col), "COLUMN"))
+        elif isinstance(record, DashboardMetadata):
+            reqs.append(self._generate_query_object(record._get_dashboard_key(), "WORKBOOK"))
+        return reqs
+
+    def _call_alvin_api(self, request_entities):
+
+        payload = {
+            "entities": request_entities
+        }
         headers = {
-            'Authorization': self.conf.get(AlvinTransformer.ALVIN_API_KEY)
+            'X-API-KEY': self.alvin_api_key
         }
 
-        response = requests.request("GET", url, params=params, headers=headers, data=payload)
+        response = requests.request("GET", f"{self.alvin_instance}{API_ENDPOINT}",
+                                    headers=headers, data=json.dumps(payload))
 
         data = json.loads(response.text)
 
@@ -100,4 +127,4 @@ class AlvinTransformer(Transformer):
         return data if isinstance(data, list) else []  # error comes in a python dict, success comes with a list
 
     def get_scope(self) -> str:
-        return 'transformer.alvin_transformer'
+        return "transformer.alvin_transformer"

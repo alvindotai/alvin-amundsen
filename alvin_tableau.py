@@ -59,6 +59,7 @@ from alvin_transformer import AlvinTransformer
 
 from dotenv import load_dotenv
 
+
 load_dotenv("./credentials.env")
 
 es_host = os.getenv("CREDENTIALS_ELASTICSEARCH_PROXY_HOST", "localhost")

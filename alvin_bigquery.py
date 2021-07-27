@@ -13,17 +13,16 @@ from databuilder.job.job import DefaultJob
 from databuilder.loader.file_system_neo4j_csv_loader import FsNeo4jCSVLoader
 from databuilder.publisher import neo4j_csv_publisher
 from databuilder.publisher.neo4j_csv_publisher import Neo4jCsvPublisher
-from databuilder.task.task import DefaultTask
-from databuilder.transformer.base_transformer import ChainedTransformer, NoopTransformer
+from databuilder.transformer.base_transformer import ChainedTransformer
 from dotenv import load_dotenv
 from pyhocon import ConfigFactory
 
 from alvin_transformer import AlvinTransformer
+from sentinel_task import SentinelTask
 
 load_dotenv("./credentials.env")
 
 logging.basicConfig(
-    filename="./error.log",
     level=logging.NOTSET
 )
 
@@ -51,16 +50,15 @@ def create_bq_job(metadata_type, gcloud_project):
     bq_meta_extractor = BigQueryMetadataExtractor()
     csv_loader = FsNeo4jCSVLoader()
 
-    task = DefaultTask(extractor=bq_meta_extractor,
-                       loader=csv_loader,
-                       transformer=ChainedTransformer(
-                           transformers=[
-                               NoopTransformer(),
-                               AlvinTransformer()
-                           ],
-                           is_init_transformers=True
-                       )
-                       )
+    task = SentinelTask(extractor=bq_meta_extractor,
+                        loader=csv_loader,
+                        transformer=ChainedTransformer(
+                            transformers=[
+                                AlvinTransformer(),
+                            ],
+                            is_init_transformers=True
+                        )
+                        )
 
     job_config = ConfigFactory.from_dict({
         f'extractor.bigquery_table_metadata.{BigQueryMetadataExtractor.PROJECT_ID_KEY}': gcloud_project,
@@ -86,5 +84,5 @@ def create_bq_job(metadata_type, gcloud_project):
 
 
 if __name__ == "__main__":
-    bq_job = create_bq_job('bigquery_metadata', 'your-project-here')
+    bq_job = create_bq_job('bigquery_metadata', 'alvinai')
     bq_job.launch()
