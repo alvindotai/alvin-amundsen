@@ -59,6 +59,7 @@ from alvin_transformer import AlvinTransformer
 
 from dotenv import load_dotenv
 
+from sentinel_task import SentinelTask
 
 load_dotenv("./credentials.env")
 
@@ -188,7 +189,7 @@ def create_es_publisher_sample_job(  # type: ignore
 
 
 def run_tableau_metadata_job():  # type: ignore
-    task = DefaultTask(extractor=TableauDashboardExtractor(),
+    task = SentinelTask(extractor=TableauDashboardExtractor(),
                        transformer=AlvinTransformer(),
                        loader=FsNeo4jCSVLoader())
 
